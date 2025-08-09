@@ -6,14 +6,131 @@ from datetime import datetime
 import os
 import random
 from syllabus import syllabus
+import re
+import requests
+import base64
+from PIL import Image
+import io
+import streamlit.components.v1 as components
+
+# MathJax integration for proper math rendering
+def render_mathjax():
+    """Add MathJax support to the Streamlit app"""
+    mathjax_script = """
+    <script>
+    window.MathJax = {
+        tex: {
+            inlineMath: [['$', '$'], ['\\(', '\\)']],
+            displayMath: [['$$', '$$'], ['\\[', '\\]']],
+            processEscapes: true,
+            processEnvironments: true
+        },
+        options: {
+            ignoreHtmlClass: ".*|",
+            processHtmlClass: "arithmatex"
+        }
+    };
+    </script>
+    <script type="text/javascript" id="MathJax-script" async
+        src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js">
+    </script>
+    """
+    components.html(mathjax_script, height=0)
+
+def render_math_content(content):
+    """Render content with MathJax support"""
+    if content.strip():
+        math_html = f"""
+        <div class="arithmatex">
+        {content.replace(chr(10), '<br>')}
+        </div>
+        <script>
+        if (window.MathJax) {{
+            MathJax.typesetPromise();
+        }}
+        </script>
+        """
+        components.html(math_html, height=100)
+
+# --- Image Processing Functions ---
+def whiten_image_background(image: Image.Image) -> Image.Image:
+    """
+    Convert image background to pure white using PIL
+    Works without any API calls!
+    """
+    # Convert to RGBA if not already
+    if image.mode != 'RGBA':
+        image = image.convert('RGBA')
+    
+    # Create a white background
+    white_bg = Image.new('RGBA', image.size, (255, 255, 255, 255))
+    
+    # Method 1: Simple approach - make light colors white
+    pixels = image.load()
+    width, height = image.size
+    
+    for y in range(height):
+        for x in range(width):
+            r, g, b, a = pixels[x, y]
+            
+            # If pixel is light (grayish/whitish background), make it pure white
+            brightness = (r + g + b) / 3
+            if brightness > 200:  # Adjust threshold as needed (0-255)
+                pixels[x, y] = (255, 255, 255, 255)  # Pure white
+    
+    # Composite on white background
+    result = Image.alpha_composite(white_bg, image)
+    
+    # Convert back to RGB
+    return result.convert('RGB')
+
+# --- AI OCR via Google Vision API (Optional) ---
+def extract_text_from_image_google_vision(image_bytes: bytes) -> dict:
+    """
+    Use Google Vision API to extract text from images.
+    Returns dict with keys: 'text' (plain text extracted)
+    """
+    try:
+        from google.cloud import vision
+        
+        # Initialize the client (uses GOOGLE_APPLICATION_CREDENTIALS env var or service account)
+        client = vision.ImageAnnotatorClient()
+        
+        # Create image object
+        image = vision.Image(content=image_bytes)
+        
+        # Perform text detection
+        response = client.text_detection(image=image)
+        texts = response.text_annotations
+        
+        if texts:
+            # First annotation contains all detected text
+            detected_text = texts[0].description
+            return {
+                "text": detected_text,
+                "latex": detected_text,  # For compatibility, same as text
+                "html": detected_text
+            }
+        else:
+            return {"text": "", "latex": "", "html": ""}
+            
+    except ImportError:
+        return {"error": "Google Vision API not installed. Run: pip install google-cloud-vision"}
+    except Exception as e:
+        return {"error": f"Google Vision error: {str(e)}"}
 
 # Initialize Firebase (works with both local JSON file and Streamlit Cloud secrets)
 def initialize_firebase():
     if not firebase_admin._apps:
         try:
-            # Try Streamlit secrets first (for deployment)
-            if "firebase" in st.secrets:
-                # Use secrets from Streamlit Cloud
+            # Prefer local JSON file for local development if present
+            if os.path.exists("firebase-service-account.json"):
+                cred = credentials.Certificate("firebase-service-account.json")
+                firebase_admin.initialize_app(cred)
+                st.success("✅ Connected to Firebase using local service account file")
+            
+            # Otherwise try Streamlit secrets (for deployment)
+            elif "firebase" in st.secrets:
                 firebase_config = {
                     "type": st.secrets["firebase"]["type"],
                     "project_id": st.secrets["firebase"]["project_id"],
@@ -29,12 +146,6 @@ def initialize_firebase():
                 cred = credentials.Certificate(firebase_config)
                 firebase_admin.initialize_app(cred)
                 st.success("✅ Connected to Firebase using Streamlit secrets")
-            
-            # Fallback to local JSON file (for local development)
-            elif os.path.exists("firebase-service-account.json"):
-                cred = credentials.Certificate("firebase-service-account.json")
-                firebase_admin.initialize_app(cred)
-                st.success("✅ Connected to Firebase using local service account file")
             
             else:
                 st.error("❌ Firebase credentials not found! Please configure Firebase secrets or add 'firebase-service-account.json' file.")
@@ -56,6 +167,8 @@ def save_mcq_to_firebase(mcq_data):
         # Add timestamp
         mcq_data['created_at'] = datetime.now()
         mcq_data['updated_at'] = datetime.now()
+        
+
         
         # Add to Firestore
         doc_ref = db.collection('mcqs').add(mcq_data)
@@ -96,6 +209,8 @@ def query_mcqs_with_filters_firebase(difficulty=None, subject=None, subject_name
         for doc in docs:
             data = doc.to_dict()
             data['doc_id'] = doc.id
+            
+
             
             # Apply tag filter if specified
             if tags and tags != "All":
@@ -161,6 +276,9 @@ def main():
         layout="wide"
     )
     
+    # Initialize MathJax for math rendering
+    render_mathjax()
+    
     # Initialize Firebase
     initialize_firebase()
     
@@ -181,9 +299,14 @@ def main():
         with col1:
             question_type = st.selectbox(
                 "Question Type *",
-                ["Question Bank", "PYQ"],
+                ["Question Bank", "PYQ", "Dummy"],
                 help="Select whether this is from Question Bank or Previous Year Question"
             )
+            st.session_state["question_type"] = question_type
+            
+            # Show testing note for Dummy type
+            if question_type == "Dummy":
+                st.markdown('<p style="color: #888888; font-size: 14px;">📝 For testing purposes only</p>', unsafe_allow_html=True)
         
         with col2:
             # Year dropdown (only if PYQ is selected)
@@ -196,6 +319,7 @@ def main():
                     index=len(year_options)-1,  # Default to 2024 (last option)
                     help="Select the year for this Previous Year Question"
                 )
+                st.session_state["year"] = year
             else:
                 st.selectbox("Year", ["Select Question Type first"], disabled=True)
         
@@ -208,6 +332,7 @@ def main():
                 subjects,
                 help="Select the subject for this question"
             )
+            st.session_state["selected_subject"] = selected_subject
         
         with col4:
             # Topic selection (based on selected subject)
@@ -217,6 +342,7 @@ def main():
                 topics,
                 help="Select the specific topic within the subject"
             )
+            st.session_state["selected_topic"] = selected_topic
         
         # Show topic description for reference
         if selected_topic:
@@ -227,54 +353,134 @@ def main():
         
         st.divider()
         
+        # Image Upload with Background Whitening
+        st.subheader("🖼️ Add Image to Question")
+        
+        uploaded_img = st.file_uploader(
+            "Upload question image (PNG/JPG)", 
+            type=["png", "jpg", "jpeg"], 
+            help="Upload an image to include with your question. Background will be automatically whitened."
+        )
+        
+        processed_image = None
+        if uploaded_img is not None:
+            col_img1, col_img2 = st.columns(2)
+            
+            with col_img1:
+                st.markdown("**Original Image:**")
+                original_image = Image.open(uploaded_img)
+                st.image(original_image, caption="Original", use_column_width=True)
+            
+            with col_img2:
+                st.markdown("**Processed Image:**")
+                # Process image - whiten background
+                processed_image = whiten_image_background(original_image)
+                st.image(processed_image, caption="White Background", use_column_width=True)
+            
+            # Option to use processed image
+            if st.button("✅ Use This Image in Question"):
+                # Convert to base64 for storage
+                buffered = io.BytesIO()
+                processed_image.save(buffered, format="PNG")
+                img_str = base64.b64encode(buffered.getvalue()).decode()
+                
+                st.session_state["question_image"] = img_str
+                st.success("✅ Image added! It will be included with your question.")
+        
+        # Show current question image if exists
+        if st.session_state.get("question_image"):
+            st.markdown("**Current Question Image:**")
+            img_data = base64.b64decode(st.session_state["question_image"])
+            st.image(img_data, caption="Will be saved with question", width=300)
+            if st.button("🗑️ Remove Image"):
+                del st.session_state["question_image"]
+                st.rerun()
+        
+
+        
         # Create the form for question content
         with st.form("mcq_form", clear_on_submit=True):
             st.subheader("✏️ Question Content")
             
-            # Show current selections in the form
+            # Show current selections in the form (using session state)
             col_summary1, col_summary2 = st.columns(2)
             with col_summary1:
-                st.info(f"**Question Type:** {question_type}" + (f" | **Year:** {year}" if year else ""))
+                q_type = st.session_state.get("question_type", question_type)
+                yr = st.session_state.get("year", year)
+                st.info(f"**Question Type:** {q_type}" + (f" | **Year:** {yr}" if yr else ""))
             with col_summary2:
-                st.info(f"**Subject:** {selected_subject} | **Topic:** {selected_topic}")
+                subj = st.session_state.get("selected_subject", selected_subject)
+                topic = st.session_state.get("selected_topic", selected_topic)
+                st.info(f"**Subject:** {subj} | **Topic:** {topic}")
             
             st.divider()
             
             # Question input
+            st.subheader("📝 Question")
             question = st.text_area(
                 "Question *",
-                placeholder="Enter your question here...",
-                height=100,
-                help="Enter the main question that students need to answer"
+                value=st.session_state.get("prefill_question", ""),
+                placeholder="Enter your question here...\n\nExample:\nFind the acceleration when F = 20N and m = 5kg using F = ma\n\nFor math symbols, use the copy-paste buttons above: x², √x, π, etc.",
+                height=120,
+                help="Use the copy-paste buttons above for math symbols and formulas"
             )
             
-            # Four options
-            st.subheader("Options")
+            # Live MathJax preview of the question
+            if question.strip():
+                st.markdown("**MathJax Preview:**")
+                render_math_content(question)
+            
+            # Four options with LaTeX support
+            st.subheader("📋 Answer Options")
+            
             col1, col2 = st.columns(2)
             
             with col1:
                 option_a = st.text_input(
                     "Option A *",
-                    placeholder="Enter option A",
-                    key="opt_a"
+                    placeholder="e.g., a = 4 m/s² or 6.02×10²³",
+                    key="opt_a",
+                    help="Use copy-paste buttons for symbols: x², √x, π, etc."
                 )
                 option_c = st.text_input(
                     "Option C *",
-                    placeholder="Enter option C",
-                    key="opt_c"
+                    placeholder="e.g., √25 = 5 or H₂O",
+                    key="opt_c",
+                    help="Use copy-paste buttons for symbols: x², √x, π, etc."
                 )
             
             with col2:
                 option_b = st.text_input(
                     "Option B *",
-                    placeholder="Enter option B",
-                    key="opt_b"
+                    placeholder="e.g., E = mc² or 3×10⁸ m/s",
+                    key="opt_b",
+                    help="Use copy-paste buttons for symbols: x², √x, π, etc."
                 )
                 option_d = st.text_input(
                     "Option D *",
-                    placeholder="Enter option D",
-                    key="opt_d"
+                    placeholder="e.g., v = 25 m/s or CO₂",
+                    key="opt_d",
+                    help="Use copy-paste buttons for symbols: x², √x, π, etc."
                 )
+            
+            # MathJax preview for options if they contain content
+            if any([option_a.strip(), option_b.strip(), option_c.strip(), option_d.strip()]):
+                st.markdown("**Options MathJax Preview:**")
+                col_prev1, col_prev2 = st.columns(2)
+                with col_prev1:
+                    if option_a.strip():
+                        st.markdown("**A:**")
+                        render_math_content(option_a)
+                    if option_c.strip():
+                        st.markdown("**C:**")
+                        render_math_content(option_c)
+                with col_prev2:
+                    if option_b.strip():
+                        st.markdown("**B:**")
+                        render_math_content(option_b)
+                    if option_d.strip():
+                        st.markdown("**D:**")
+                        render_math_content(option_d)
             
             # Correct answer
             correct_answer = st.selectbox(
@@ -291,12 +497,18 @@ def main():
             )
             
             # Solution
+            st.subheader("💡 Solution")
             solution = st.text_area(
                 "Solution *",
-                placeholder="Provide detailed solution/explanation...",
-                height=120,
-                help="Explain how to solve this question"
+                placeholder="Provide detailed solution/explanation...\n\nExample:\nStep 1: Apply the formula F = ma\nStep 2: Substitute values: F = 5 × 4 = 20N\nStep 3: Therefore, the force is 20N\n\nUse copy-paste buttons for symbols: ×, ², π, etc.",
+                height=150,
+                help="Show step-by-step working. Use the copy-paste buttons for math symbols."
             )
+            
+            # MathJax preview for solution if it contains content
+            if solution.strip():
+                st.markdown("**Solution MathJax Preview:**")
+                render_math_content(solution)
             
             # Tags (additional field)
             tags = st.text_input(
@@ -313,10 +525,16 @@ def main():
             )
             
             if submitted:
+                # Get values from session state for validation
+                q_type = st.session_state.get("question_type", "Question Bank")
+                yr = st.session_state.get("year", None)
+                subj = st.session_state.get("selected_subject", "")
+                topic = st.session_state.get("selected_topic", "")
+                
                 # Validation
                 if not all([question, option_a, option_b, option_c, option_d, solution]):
                     st.error("Please fill in all required fields marked with *")
-                elif question_type == "PYQ" and not year:
+                elif q_type == "PYQ" and not yr:
                     st.error("Please provide the year for PYQ questions")
                 else:
                     # Prepare data for Firebase
@@ -331,13 +549,17 @@ def main():
                         "correct_answer": correct_answer,
                         "difficulty": difficulty,
                         "solution": solution.strip(),
-                        "question_type": question_type,
-                        "year": year if question_type == "PYQ" else None,
-                        "subject": subject.strip() if subject else None,  # Combined for backward compatibility
-                        "subject_name": selected_subject,  # Separate subject field
-                        "topic_name": selected_topic,  # Separate topic field
+                        "question_type": q_type,
+                        "year": yr if q_type == "PYQ" else None,
+                        "subject": f"{subj} - {topic}" if subj and topic else None,  # Combined for backward compatibility
+                        "subject_name": subj,  # Separate subject field
+                        "topic_name": topic,  # Separate topic field
                         "tags": [tag.strip() for tag in tags.split(",")] if tags else []
                     }
+                    
+                    # Only add question_image if there's actual image data
+                    if st.session_state.get("question_image"):
+                        mcq_data["question_image"] = st.session_state.get("question_image")
                     
                     # Save to Firebase
                     with st.spinner("Saving MCQ to Firebase..."):
@@ -345,6 +567,9 @@ def main():
                     
                     if success:
                         st.success(f"✅ MCQ saved successfully! Document ID: {result}")
+                        # Clear the question image from session state after successful save
+                        if "question_image" in st.session_state:
+                            del st.session_state["question_image"]
                         st.balloons()
                     else:
                         st.error(f"❌ Error saving MCQ: {result}")
@@ -359,6 +584,15 @@ def main():
             for doc in docs:
                 data = doc.to_dict()
                 with st.expander(f"Q: {data['question'][:100]}..."):
+                    # Display question image first if exists
+                    if data.get('question_image'):
+                        try:
+                            img_data = base64.b64decode(data['question_image'])
+                            st.image(img_data, caption="Question Image", width=400)
+                        except Exception as e:
+                            st.error(f"Error loading image: {str(e)}")
+                    
+                    st.write(f"**Question:** {data['question']}")
                     st.write(f"**Difficulty:** {data['difficulty']}")
                     st.write(f"**Type:** {data['question_type']}")
                     if data.get('year'):
@@ -518,6 +752,14 @@ def main():
                             col1, col2 = st.columns([3, 1])
                             
                             with col1:
+                                # Display question image first if exists
+                                if mcq.get('question_image'):
+                                    try:
+                                        img_data = base64.b64decode(mcq['question_image'])
+                                        st.image(img_data, caption="Question Image", width=400)
+                                    except Exception as e:
+                                        st.error(f"Error loading image: {str(e)}")
+                                
                                 st.markdown(f"**Q{i}:** {mcq['question']}")
                                 
                                 st.markdown("**Options:**")
